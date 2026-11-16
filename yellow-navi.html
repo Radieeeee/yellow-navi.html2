@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>黄色マーカー屋内ナビ(試作)</title>
+<style>
+:root{box-sizing:border-box;--bg:#fff;--fg:#111;--bd:#bbb;--card:#f3f3f3;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#111;--fg:#f4f4f4;--bd:#444;--card:#1e1e1e}}
+:root[data-theme="dark"]{--bg:#111;--fg:#f4f4f4;--bd:#444;--card:#1e1e1e}
+html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,"Noto Sans JP",sans-serif;padding:12px;max-width:640px;margin:0 auto}
+h1{font-size:1.15rem;margin:4px 0 10px}
+#go{display:block;width:100%;min-height:34vh;font-size:2rem;font-weight:700;border:0;border-radius:18px;background:#ffd43b;color:#111}
+#go.on{background:#e5484d;color:#fff}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px;margin-top:10px;font-size:.9rem}
+canvas{width:100%;border-radius:8px;background:#000;display:block}
+#log{font-size:1.05rem;font-weight:600;margin:8px 0}
+label{display:block;margin-top:6px}input[type=range]{width:100%}
+</style></head><body>
+<h1>黄色マーカー屋内ナビ(試作・第一段階)</h1>
+<button id="go" aria-label="案内を開始">開始</button>
+<div class="card"><div id="log">待機中</div><div id="st"></div>
+<canvas id="c" width="160" height="120"></canvas></div>
+<details class="card"><summary>調整(付き添いの方向け)</summary>
+<label>色相 下限 <span id="v1"></span><input id="hmin" type="range" min="20" max="70" value="38"></label>
+<label>色相 上限 <span id="v2"></span><input id="hmax" type="range" min="50" max="100" value="72"></label>
+<label>彩度 下限(%) <span id="v3"></span><input id="smin" type="range" min="10" max="90" value="45"></label>
+<label>明度 下限(%) <span id="v4"></span><input id="vmin" type="range" min="10" max="90" value="35"></label>
+<label>カメラの水平画角(度) <span id="v5"></span><input id="fov" type="range" min="40" max="90" value="60"></label>
+<label>カメラの下向き角度(度) <span id="v6"></span><input id="pitch" type="range" min="5" max="80" value="40"></label>
+<label><input id="auto" type="checkbox" checked> 傾きセンサーで自動調整(上の角度は無視)</label>
+<label>カメラの高さ(cm・身長170cmの胸ポケット) <span id="v7"></span><input id="cam" type="range" min="100" max="150" value="125"></label>
+<label>白杖の先までの距離(cm・約2歩) <span id="v8"></span><input id="cane" type="range" min="100" max="200" value="140"></label>
+<p>使い方:開始を押すと8秒後に動作します。その間にスマホを胸ポケットへ入れ、カメラを前方の床へ向けてください(やや下向き)。この試作は白杖・盲導犬などの代わりにはなりません。</p></details>
+<script>
+const $=id=>document.getElementById(id);
+const v=document.createElement('video');v.setAttribute('playsinline','');v.muted=true;
+const cv=$('c'),ctx=cv.getContext('2d',{willReadFrequently:true});
+const P={hmin:38,hmax:72,smin:45,vmin:35,fov:60,pitch:40,cam:125,cane:140};
+['hmin','hmax','smin','vmin','fov','pitch','cam','cane'].forEach((k,i)=>{const e=$(k),s=$('v'+(i+1));const f=()=>{P[k]=+e.value;s.textContent=e.value};e.oninput=f;f()});
+let running=false,stream,wake,timer,startT,busy=false,cur=null,lastSpeak=0;
+let S;
+function reset(){S={state:'seek',cnt:{sq:0,ci:0},lastSq:0,lastCi:0,armGoal:false,goalSaid:false,ciFar:false,ciNear:false,
+ angS:null,hCand:0,hN:0,hLast:0,lastLost:0,lastAny:performance.now(),lastSeekMsg:0}}
+function speak(t,lv){
+ $('log').textContent=t;
+ if(!('speechSynthesis' in window))return;
+ const ss=speechSynthesis;
+ if(lv<2&&busy)return;
+ if(lv===0&&ss.speaking)return;
+ if(lv>=1)ss.cancel();
+ const u=new SpeechSynthesisUtterance(t);u.lang='ja-JP';u.rate=1.1;cur=u;
+ if(lv===2){busy=true;const e=()=>{if(cur===u)busy=false};u.onend=e;u.onerror=e;if(navigator.vibrate)navigator.vibrate(200)}
+ ss.speak(u);lastSpeak=performance.now();
+}
+function hourOf(x,w){
+ const f=(w/2)/Math.tan(P.fov/2*Math.PI/180);
+ return Math.atan((x-w/2)/f)*180/Math.PI;
+}
+function toHour(ang){let k=Math.max(-2,Math.min(2,Math.round(ang/30)));return (k+12)%12||12}
+function hText(h){return h===12?'12時、まっすぐです':h+'時の方向です'}
+const steps=d=>Math.max(1,Math.round(d/0.7));
+function makeGeo(w,h){
+ const f=(w/2)/Math.tan(P.fov/2*Math.PI/180),hc=P.cam/100,th=P.pitch*Math.PI/180;
+ return (x,y)=>{
+  const ph=Math.atan((y-h/2)/f),al=th+ph;
+  if(al<0.05)return {d:99,a:0,ok:false};
+  const z=hc/Math.sin(al)*Math.cos(ph),d=hc/Math.tan(al);
+  return {d,a:Math.atan2((x-w/2)/f*z,d)*180/Math.PI,ok:true};
+ };
+}
+function analyze(w,h){
+ const G=makeGeo(w,h);
+ const d=ctx.getImageData(0,0,w,h).data,N=w*h,m=new Uint8Array(N);
+ const sm=P.smin/100,vm=P.vmin/100;
+ for(let i=0,j=0;i<N;i++,j+=4){
+  const r=d[j],g=d[j+1],b=d[j+2],mx=Math.max(r,g,b),mn=Math.min(r,g,b),df=mx-mn;
+  if(!df||mx/255<vm||df/mx<sm)continue;
+  let hh;if(mx===r)hh=60*(((g-b)/df+6)%6);else if(mx===g)hh=60*((b-r)/df+2);else hh=60*((r-g)/df+4);
+  if(hh>=P.hmin&&hh<=P.hmax)m[i]=1;
+ }
+ const lab=new Int32Array(N),stk=new Int32Array(N),ord=new Int32Array(N),bl=[];let on=0;
+ for(let s=0;s<N;s++){
+  if(!m[s]||lab[s])continue;
+  const id=bl.length+1;let sp=0;stk[sp++]=s;lab[s]=id;
+  const b={id,a:0,x0:w,x1:0,y0:h,y1:0,sx:0,sy:0,sxx:0,syy:0,sxy:0,o0:on,t:''};
+  while(sp){
+   const p=stk[--sp];ord[on++]=p;const x=p%w,y=(p-x)/w;
+   b.a++;b.sx+=x;b.sy+=y;b.sxx+=x*x;b.syy+=y*y;b.sxy+=x*y;
+   if(x<b.x0)b.x0=x;if(x>b.x1)b.x1=x;if(y<b.y0)b.y0=y;if(y>b.y1)b.y1=y;
+   if(x>0&&m[p-1]&&!lab[p-1]){lab[p-1]=id;stk[sp++]=p-1}
+   if(x<w-1&&m[p+1]&&!lab[p+1]){lab[p+1]=id;stk[sp++]=p+1}
+   if(y>0&&m[p-w]&&!lab[p-w]){lab[p-w]=id;stk[sp++]=p-w}
+   if(y<h-1&&m[p+w]&&!lab[p+w]){lab[p+w]=id;stk[sp++]=p+w}
+  }
+  b.o1=on;bl.push(b);
+ }
+ const out={sq:[],ci:[],ln:[],all:bl};
+ for(const b of bl){
+  if(b.a<20)continue;
+  const bw=b.x1-b.x0+1,bh=b.y1-b.y0+1;
+  b.bw=bw;b.bh=bh;b.cx=b.sx/b.a;b.cy=b.sy/b.a;
+  const vxx=b.sxx/b.a-b.cx*b.cx,vyy=b.syy/b.a-b.cy*b.cy,vxy=b.sxy/b.a-b.cx*b.cy;
+  const t=(vxx+vyy)/2,q=Math.sqrt(((vxx-vyy)/2)**2+vxy*vxy);
+  const el=Math.sqrt((t+q)/Math.max(t-q,0.1)),fill=b.a/(bw*bh);
+  if(el>2.6&&b.a>=40){
+   b.t='ln';let sx=0,sy=0,sa=0,n=0,fx=0,fy=0,fn=0;const lim=b.y0+Math.max(1,bh*0.3);
+   for(let k=b.o0;k<b.o1;k++){const p=ord[k],x=p%w,y=(p-x)/w,g=G(x,y);if(g.ok&&g.d>=1&&g.d<=3){sx+=x;sy+=y;sa+=g.a;n++}if(y<=lim){fx+=x;fy+=y;fn++}}
+   if(n){b.tx=sx/n;b.ty=sy/n;b.ang=sa/n}else{b.tx=fx/fn;b.ty=fy/fn;b.ang=G(b.tx,b.ty).a}out.ln.push(b);
+  }else if(el<2&&b.a>=60){
+   const cw=Math.max(2,Math.round(bw*.25)),ch=Math.max(2,Math.round(bh*.25));let c=0,tt=0;
+   for(const [ox,oy] of [[b.x0,b.y0],[b.x1-cw+1,b.y0],[b.x0,b.y1-ch+1],[b.x1-cw+1,b.y1-ch+1]])
+    for(let y=oy;y<oy+ch;y++)for(let x=ox;x<ox+cw;x++){tt++;if(lab[y*w+x]===b.id)c++}
+   const cf=c/tt;
+   if(cf>0.6&&fill>0.8){b.t='sq';b.g=G(b.cx,b.cy);if(b.g.ok)out.sq.push(b)}
+   else if(cf<0.45&&fill>0.6&&fill<0.9){b.t='ci';b.g=G(b.cx,b.cy);if(b.g.ok)out.ci.push(b)}
+  }
+ }
+ for(const k of ['sq','ci','ln'])out[k].sort((a,b)=>b.a-a.a);
+ return out;
+}
+function step(){
+ if(!running||!v.videoWidth)return;
+ const now=performance.now(),w=160,h=Math.round(w*v.videoHeight/v.videoWidth);
+ if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}
+ ctx.drawImage(v,0,0,w,h);
+ const r=analyze(w,h),sq=r.sq[0],ci=r.ci[0],ln=r.ln[0];
+ if(busy&&now-lastSpeak>8000)busy=false;
+ S.cnt.sq=sq?S.cnt.sq+1:0;S.cnt.ci=ci?S.cnt.ci+1:0;
+ if(sq)S.lastSq=now;if(ci)S.lastCi=now;
+ if(sq||ci||ln)S.lastAny=now;
+ const sqOK=S.cnt.sq>=3,ciOK=S.cnt.ci>=3;
+ let target=null,label='';
+ if(S.state==='seek'){
+  if(sqOK){const near=sq.g.d<=P.cane/100+0.3;if(near){S.state='follow';S.lastSq=now;speak('杖がスタートの四角に近づきました。スタート地点です。黄色い線に沿って進みます。',2)}else if(now-S.lastSeekMsg>4000){S.lastSeekMsg=now;speak('スタートの四角は、'+toHour(sq.g.a)+'時の方向、約'+steps(sq.g.d)+'歩先です。',1)}}
+  else if(now-S.lastSeekMsg>8000){S.lastSeekMsg=now;speak('スタートの四角を探しています。',0)}
+ }else if(S.state==='follow'){
+  if(!S.armGoal&&now-S.lastSq>1500)S.armGoal=true;
+  if(!ciOK&&now-S.lastCi>1500){S.ciFar=false;S.ciNear=false}
+  if(S.armGoal&&sqOK){
+   const near=sq.g.d<=P.cane/100+0.3;
+   if(near){S.state='done';speak('杖がゴールに近づきました。ゴールです。到着しました。',2);label='goal'}
+   else{
+    if(!S.goalSaid){S.goalSaid=true;speak('前方、'+toHour(sq.g.a)+'時の方向、約'+steps(sq.g.d)+'歩先にゴールがあります。',2)}
+    target={x:sq.cx,y:sq.cy,a:sq.g.a};
+   }
+  }else if(ciOK){
+   const near=ci.g.d<=P.cane/100+0.3;
+   if(near&&!S.ciNear){
+    S.ciNear=true;S.ciFar=true;
+    const hs=[...new Set(r.ln.map(b=>toHour(b.ang)))].sort((a,b)=>(a>6?a-12:a)-(b>6?b-12:b));
+    speak(hs.length?'杖が分岐に近づきました。道は、'+hs.map(x=>x+'時').join('、')+'の方向です。':'分岐です。',2);
+   }else if(!near&&!S.ciFar){S.ciFar=true;speak('前方、'+toHour(ci.g.a)+'時の方向、約'+steps(ci.g.d)+'歩先に分岐があります。',2)}
+  }
+  if(!target&&ln)target={x:ln.tx,y:ln.ty,a:ln.ang};
+  if(S.state==='follow'){
+   if(target){
+    const a=target.a;S.angS=S.angS===null?a:S.angS*0.6+a*0.4;
+    const hr=toHour(S.angS);
+    if(hr===S.hCand)S.hN++;else{S.hCand=hr;S.hN=1}
+    if(S.hN>=3){
+     if(hr!==S.hLast){S.hLast=hr;speak(hText(hr),1)}
+     else if(now-lastSpeak>4000)speak('そのまま、'+hText(hr),0);
+    }
+    S.lastLost=0;label=hr+'時';
+   }else{
+    S.angS=null;S.hLast=0;
+    if(now-S.lastAny>1500&&now-S.lastLost>5000){S.lastLost=now;speak('線が見えません。ゆっくり止まって、カメラの向きを確認してください。',1)}
+   }
+  }
+ }
+ // デバッグ描画
+ ctx.lineWidth=1;ctx.font='9px sans-serif';
+ for(const b of r.all){if(!b.t)continue;
+  ctx.strokeStyle=b.t==='sq'?'#f33':b.t==='ci'?'#39f':'#3f3';
+  ctx.strokeRect(b.x0,b.y0,b.bw,b.bh);ctx.fillStyle=ctx.strokeStyle;
+  ctx.fillText(b.t==='sq'?'四角':b.t==='ci'?'円':'線',b.x0,Math.max(9,b.y0-1));}
+ if(target){ctx.fillStyle='#fff';ctx.fillRect(target.x-2,target.y-2,5,5)}
+ $('st').textContent='状態: '+S.state+(S.armGoal?'(ゴール探索)':'')+' / 向き: '+(label||'-')+' / 傾き: '+Math.round(P.pitch)+'度';
+}
+async function start(){
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:640},height:{ideal:480}},audio:false});
+ }catch(e){speak('カメラを使えません。カメラの許可を確認してください。',2);$('log').textContent='カメラエラー: '+e.name;return}
+ v.srcObject=stream;await v.play();
+ try{wake=await navigator.wakeLock.request('screen')}catch(e){}
+ reset();
+ $('go').textContent='停止';$('go').classList.add('on');$('go').setAttribute('aria-label','案内を停止');
+ speak('8秒後に開始します。スマホを胸ポケットに入れ、カメラを前方の床に向けてください。',2);
+ running=false;
+ timer=setTimeout(()=>{running=true;reset();S.lastAny=performance.now();speak('案内を開始します。',2);timer=setInterval(step,100)},8000);
+ $('go').dataset.on='1';
+}
+function stop(){
+ running=false;clearTimeout(timer);clearInterval(timer);
+ if(stream)stream.getTracks().forEach(t=>t.stop());
+ try{wake&&wake.release()}catch(e){}
+ $('go').textContent='開始';$('go').classList.remove('on');$('go').setAttribute('aria-label','案内を開始');$('go').dataset.on='';
+ speak('停止しました。',2);
+}
+$('go').onclick=()=>{$('go').dataset.on?stop():start()};
+addEventListener('deviceorientation',e=>{if(e.beta!=null&&$('auto').checked)P.pitch=Math.max(5,Math.min(80,0.8*P.pitch+0.2*(90-e.beta)))});
+reset();
+</script></body></html>
